@@ -1,0 +1,107 @@
+# name: test/sql/optimizer/expression/enum_full_domain_behavior.test
+# description: Baseline plan behavior of full-domain ENUM (NOT) IN predicates across nullable, side-effect, DML and stats-free contexts
+# group: [expression]
+
+statement ok
+SET profiling_renderer_settings = MAP {'operator_casing': 'upper'};
+
+statement ok
+CREATE TYPE mood AS ENUM('sad', 'ok', 'happy');
+
+# column with provably no NULLs
+statement ok
+CREATE TABLE covered AS SELECT ['sad', 'ok', 'happy'][1 + (range % 3)]::mood AS m FROM range(6144);
+
+# column that can contain NULLs
+statement ok
+CREATE TABLE nullables(m mood);
+
+statement ok
+INSERT INTO nullables SELECT ['sad', 'ok', 'happy'][1 + (range % 3)]::mood FROM range(6144);
+
+statement ok
+INSERT INTO nullables VALUES (NULL);
+
+# 1. clean query + non-NULL column: NOT IN over the full domain collapses to a constant false
+#    and the whole filter becomes an empty result
+query II
+explain
+SELECT count(*) FROM covered WHERE m NOT IN ('sad', 'ok', 'happy');
+----
+physical_plan	<REGEX>:.*EMPTY.*
+
+query I
+SELECT count(*) FROM covered WHERE m NOT IN ('sad', 'ok', 'happy');
+----
+0
+
+# 2. nullable column: the input nullability check fails, the filter stays as a
+#    constant_or_null predicate evaluated per row - no empty result collapse
+query II
+explain
+SELECT count(*) FROM nullables WHERE m NOT IN ('sad', 'ok', 'happy');
+----
+physical_plan	<REGEX>:.*constant_or_null.*
+
+query I
+SELECT count(*) FROM nullables WHERE m NOT IN ('sad', 'ok', 'happy');
+----
+0
+
+# 3. volatile expressions in a projection do NOT gate the simplification pass
+#    (HasSideEffects only covers DML operators): the non-NULL column still collapses
+query II
+explain
+SELECT random() FROM covered WHERE m NOT IN ('sad', 'ok', 'happy');
+----
+physical_plan	<REGEX>:.*EMPTY.*
+
+# 3b. the same query on a nullable column cannot collapse (nullability unproven),
+#     so the per-row constant_or_null filter survives
+query II
+explain
+SELECT random() FROM nullables WHERE m NOT IN ('sad', 'ok', 'happy');
+----
+physical_plan	<REGEX>:.*constant_or_null.*
+
+# 4. DML plans always carry side effects (HasSideEffects): the simplification pass is
+#    skipped entirely, the DELETE below keeps a per-row filter and reads every row group
+query II
+explain
+DELETE FROM covered WHERE m NOT IN ('sad', 'ok', 'happy');
+----
+physical_plan	<REGEX>:.*constant_or_null.*
+
+statement ok
+DELETE FROM covered WHERE m NOT IN ('sad', 'ok', 'happy');
+
+query I
+SELECT count(*) FROM covered;
+----
+6144
+
+# 5. positive IN over the full domain on a non-NULL column: the filter is removed
+#    entirely (no constant_or_null left in the plan)
+query II
+explain
+SELECT count(*) FROM covered WHERE m IN ('sad', 'ok', 'happy');
+----
+physical_plan	<!REGEX>:.*constant_or_null.*
+
+query I
+SELECT count(*) FROM covered WHERE m IN ('sad', 'ok', 'happy');
+----
+6144
+
+# 6. stats-free input (VALUES): the rewrite still happens, but nullability cannot
+#    be proven, so the per-row constant_or_null filter survives
+query II
+explain
+SELECT count(*) FROM (VALUES ('sad'::mood), ('ok'::mood), ('happy'::mood)) v(m) WHERE m NOT IN ('sad', 'ok', 'happy');
+----
+physical_plan	<REGEX>:.*constant_or_null.*
+
+query I
+SELECT count(*) FROM (VALUES ('sad'::mood), ('ok'::mood), ('happy'::mood)) v(m) WHERE m NOT IN ('sad', 'ok', 'happy');
+----
+0
