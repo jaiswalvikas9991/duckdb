@@ -110,3 +110,27 @@ query I
 SELECT count(*) FROM (VALUES ('sad'::mood), ('ok'::mood), ('happy'::mood)) v(m) WHERE m NOT IN ('sad', 'ok', 'happy');
 ----
 0
+
+# 7. DML CTE stale statistics: the CTE inserts a NULL that the statement's statistics
+#    snapshot (taken before execution) does not see. Folding constant_or_null into a
+#    plain constant relies on that snapshot to prove m non-NULL, so it must stay
+#    disabled on side-effecting plans - otherwise the freshly inserted NULL row would
+#    slip through the IN filter
+statement ok
+CREATE TABLE guard_check(m mood);
+
+statement ok
+INSERT INTO guard_check VALUES ('sad'), ('ok'), ('happy');
+
+# the filter is NOT folded away: the scan keeps evaluating constant_or_null per row
+query II
+explain
+WITH ins AS (INSERT INTO guard_check VALUES (NULL) RETURNING *) SELECT count(*) FROM guard_check WHERE m IN ('sad', 'ok', 'happy');
+----
+physical_plan	<REGEX>:.*constant_or_null.*
+
+# the CTE-inserted NULL row is visible to the main query but must be filtered out
+query I
+WITH ins AS (INSERT INTO guard_check VALUES (NULL) RETURNING *) SELECT count(*) FROM guard_check WHERE m IN ('sad', 'ok', 'happy');
+----
+3
