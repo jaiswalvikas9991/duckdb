@@ -69,12 +69,18 @@ static bool ConstantOrNullInputsAreNotNull(LogicalOperator &input, BoundFunction
 
 unique_ptr<Expression> ConstantOrNullSimplification::SimplifyExpression(LogicalOperator &input,
                                                                         unique_ptr<Expression> expr,
-                                                                        NotNullExpressionAnalyzer &analyzer) {
+                                                                        NotNullExpressionAnalyzer &analyzer,
+                                                                        bool allow_folding) {
 	ExpressionIterator::EnumerateChildren(*expr, [&](unique_ptr<Expression> &child) {
-		child = SimplifyExpression(input, std::move(child), analyzer);
+		child = SimplifyExpression(input, std::move(child), analyzer, allow_folding);
 	});
 
 	if (expr->GetExpressionClass() == ExpressionClass::BOUND_FUNCTION) {
+		// Folding constant_or_null into a plain constant drops the per-row evaluation of its
+		// inputs, so it is only safe when the filter carries no volatile expressions.
+		if (!allow_folding) {
+			return expr;
+		}
 		auto value = GetConstantOrNullBoolean(*expr);
 		if (!value.has_value()) {
 			return expr;
@@ -92,6 +98,10 @@ unique_ptr<Expression> ConstantOrNullSimplification::SimplifyExpression(LogicalO
 		return expr;
 	}
 
+	// The rewrites below are shape-only transformations: NOT(constant_or_null(true, x))
+	// becomes constant_or_null(false, x) with x still evaluated per row, and NOT over a
+	// boolean constant is pure constant folding. Both keep every expression evaluation
+	// intact, so they are safe even in plans that carry side effects (e.g. DML).
 	auto &not_expr = expr->Cast<BoundOperatorExpression>();
 	D_ASSERT(not_expr.GetChildren().size() == 1);
 
@@ -119,17 +129,26 @@ unique_ptr<Expression> ConstantOrNullSimplification::SimplifyExpression(LogicalO
 	return ExpressionRewriter::ConstantOrNull(std::move(children), Value::BOOLEAN(!value.value()));
 }
 
-unique_ptr<LogicalOperator> ConstantOrNullSimplification::OptimizeFilter(unique_ptr<LogicalOperator> op) {
+unique_ptr<LogicalOperator> ConstantOrNullSimplification::OptimizeFilter(unique_ptr<LogicalOperator> op,
+                                                                         bool plan_has_side_effects) {
 	auto &filter = op->Cast<LogicalFilter>();
 	if (filter.children.size() != 1) {
 		return op;
 	}
 
+	// Folding constant_or_null into a constant drops the evaluation of the folded-away
+	// inputs, so it is only safe when (1) the plan carries no side effects - a DML
+	// operator can invalidate the table statistics that NotNullExpressionAnalyzer relies
+	// on (e.g. a DML CTE inserts NULLs that the statement's statistics snapshot does not
+	// see), and (2) the filter holds no volatile expressions. The NOT(constant_or_null(...))
+	// shape rewrite above is unaffected by both checks.
+	const bool allow_folding = !plan_has_side_effects && !filter.HasVolatileExpressions();
+
 	NotNullExpressionAnalyzer analyzer(context);
 	vector<unique_ptr<Expression>> remaining_expressions;
 	remaining_expressions.reserve(filter.expressions.size());
 	for (auto &expr : filter.expressions) {
-		expr = SimplifyExpression(*filter.children[0], std::move(expr), analyzer);
+		expr = SimplifyExpression(*filter.children[0], std::move(expr), analyzer, allow_folding);
 		auto value = GetBooleanConstant(*expr);
 		if (!value.has_value()) {
 			remaining_expressions.push_back(std::move(expr));
@@ -153,12 +172,21 @@ unique_ptr<LogicalOperator> ConstantOrNullSimplification::OptimizeFilter(unique_
 }
 
 unique_ptr<LogicalOperator> ConstantOrNullSimplification::Optimize(unique_ptr<LogicalOperator> op) {
+	// whether the plan carries side effects is computed once at the root: DML operators
+	// inside the plan (including DML CTEs) invalidate the statistics-based nullability
+	// analysis, so folding must be disabled for the whole plan
+	const bool has_side_effects = op->HasSideEffects();
+	return OptimizeInternal(std::move(op), has_side_effects);
+}
+
+unique_ptr<LogicalOperator> ConstantOrNullSimplification::OptimizeInternal(unique_ptr<LogicalOperator> op,
+                                                                           bool plan_has_side_effects) {
 	for (auto &child : op->children) {
-		child = Optimize(std::move(child));
+		child = OptimizeInternal(std::move(child), plan_has_side_effects);
 	}
 
 	if (op->type == LogicalOperatorType::LOGICAL_FILTER) {
-		return OptimizeFilter(std::move(op));
+		return OptimizeFilter(std::move(op), plan_has_side_effects);
 	}
 
 	return op;

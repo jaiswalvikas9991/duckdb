@@ -67,13 +67,14 @@ SELECT random() FROM nullables WHERE m NOT IN ('sad', 'ok', 'happy');
 ----
 physical_plan	<REGEX>:.*EMPTY.*
 
-# 4. DML plans always carry side effects (HasSideEffects): the simplification pass is
-#    skipped entirely, the DELETE below keeps a per-row filter and reads every row group
+# 4. DML plans no longer gate the pass as a whole: the NOT(constant_or_null(true, m))
+#    shape rewrite is a pure transformation that keeps evaluating m, so the filter
+#    collapses to an empty result here as well (false-or-null semantics)
 query II
 explain
 DELETE FROM covered WHERE m NOT IN ('sad', 'ok', 'happy');
 ----
-physical_plan	<REGEX>:.*constant_or_null.*
+physical_plan	<REGEX>:.*EMPTY.*
 
 statement ok
 DELETE FROM covered WHERE m NOT IN ('sad', 'ok', 'happy');
