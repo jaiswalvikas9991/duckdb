@@ -134,3 +134,11 @@ query I
 WITH ins AS (INSERT INTO guard_check VALUES (NULL) RETURNING *) SELECT count(*) FROM guard_check WHERE m IN ('sad', 'ok', 'happy');
 ----
 3
+
+# pin the premise: the count above is only meaningful if the CTE really ran and its NULL row
+# is visible here - without this check a planner bug that dropped the side-effecting CTE
+# would also yield 3
+query I
+SELECT count(*) FROM guard_check WHERE m IS NULL;
+----
+1
