@@ -1,15 +1,6 @@
-# name: test/sql/optimizer/expression/known_issue_fold_uncommitted_stats.test
-# description: KNOWN ISSUE - folding constant_or_null on statistics that ignore uncommitted appends
+# name: test/sql/optimizer/expression/uncommitted_appends_fold_guard.test
+# description: Folding guard against uncommitted appends that committed-only statistics do not see
 # group: [expression]
-#
-# NotNullExpressionAnalyzer proves a column non-NULL from table->GetStatistics(), which only
-# covers committed row groups. Rows appended earlier in the same transaction live in LocalStorage:
-# the scan sees them, the statistics do not. The plans below contain no DML at all, so the
-# !plan->HasSideEffects() guard does not catch it, and constant_or_null(TRUE, col) is folded into
-# TRUE - dropping the filter and letting NULL rows through.
-#
-# The assertions encode the CORRECT results. They fail today (both return 4) and are kept on
-# purpose until the analyzer stops trusting statistics that ignore uncommitted appends.
 
 statement ok
 CREATE TABLE t(i INTEGER);
