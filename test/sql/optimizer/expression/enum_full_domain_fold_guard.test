@@ -113,3 +113,32 @@ query I
 EXECUTE p;
 ----
 3
+
+# volatility does NOT gate the fold: folding constant_or_null(c, x) drops only the per-row
+# evaluation of x, and the nullability proof can establish x only as a column reference or a
+# non-NULL constant - never as a volatile expression. A volatile sibling conjunct (random()
+# here), or a volatile expression in an operator below the filter, keeps being evaluated and
+# must not disable the fold.
+statement ok
+CREATE TABLE t_vol(m mood);
+
+statement ok
+INSERT INTO t_vol SELECT ['sad', 'ok', 'happy'][1 + (range % 3)]::mood FROM range(1024);
+
+query II
+explain
+SELECT count(*) FROM t_vol WHERE m IN ('sad', 'ok', 'happy') AND random() > 0.5;
+----
+physical_plan	<!REGEX>:.*IS NOT NULL.*
+
+query II
+explain
+SELECT count(*) FROM (SELECT m, random() AS r FROM t_vol) t WHERE m IN ('sad', 'ok', 'happy') AND r > 0.5;
+----
+physical_plan	<!REGEX>:.*IS NOT NULL.*
+
+query I
+SELECT count(*) FROM t_vol WHERE m IN ('sad', 'ok', 'happy');
+----
+1024
+

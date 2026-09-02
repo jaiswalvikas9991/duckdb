@@ -46,11 +46,18 @@ static optional<bool> GetConstantOrNullBoolean(Expression &expr) {
 	return optional<bool>();
 }
 
+//! Whether every input that can still turn the result into NULL is provably NOT NULL.
 static bool ConstantOrNullInputsAreNotNull(LogicalOperator &input, BoundFunctionExpression &func,
                                            NotNullExpressionAnalyzer &analyzer) {
 	auto &children = func.GetChildren();
 	D_ASSERT(children.size() >= 2);
 
+	// constant_or_null(c, x...) evaluates to c, except for rows where any input is NULL -
+	// those rows yield NULL instead. Folding the call into the plain constant c is therefore
+	// only valid when no row can produce a NULL through an input: non-NULL constant inputs
+	// are skipped, and every other input must be proven NOT NULL by the analyzer. A NULL
+	// constant input, or an input whose nullability cannot be proven, keeps the per-row
+	// evaluation intact.
 	for (idx_t child_idx = 1; child_idx < children.size(); ++child_idx) {
 		if (children[child_idx]->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
 			auto &constant = children[child_idx]->Cast<BoundConstantExpression>().GetValue();
@@ -67,6 +74,21 @@ static bool ConstantOrNullInputsAreNotNull(LogicalOperator &input, BoundFunction
 	return true;
 }
 
+//! Whether any input of the constant_or_null call is volatile. Folding replaces the call by its
+//! constant, which drops the per-row evaluation of the inputs; the NOT-NULL proof in
+//! ConstantOrNullInputsAreNotNull can currently only establish column references or non-NULL
+//! constants (neither of which is volatile), but the check keeps folding from ever skipping a
+//! volatile evaluation if that proof is extended.
+static bool ConstantOrNullInputsAreVolatile(BoundFunctionExpression &func) {
+	auto &children = func.GetChildren();
+	for (idx_t child_idx = 1; child_idx < children.size(); ++child_idx) {
+		if (children[child_idx]->IsVolatile()) {
+			return true;
+		}
+	}
+	return false;
+}
+
 unique_ptr<Expression> ConstantOrNullSimplification::SimplifyExpression(LogicalOperator &input,
                                                                         unique_ptr<Expression> expr,
                                                                         NotNullExpressionAnalyzer &analyzer,
@@ -76,8 +98,6 @@ unique_ptr<Expression> ConstantOrNullSimplification::SimplifyExpression(LogicalO
 	});
 
 	if (expr->GetExpressionClass() == ExpressionClass::BOUND_FUNCTION) {
-		// Folding constant_or_null into a plain constant drops the per-row evaluation of its
-		// inputs, so it is only safe when the filter carries no volatile expressions.
 		if (!allow_folding) {
 			return expr;
 		}
@@ -87,7 +107,7 @@ unique_ptr<Expression> ConstantOrNullSimplification::SimplifyExpression(LogicalO
 		}
 
 		auto &func = expr->Cast<BoundFunctionExpression>();
-		if (ConstantOrNullInputsAreNotNull(input, func, analyzer)) {
+		if (!ConstantOrNullInputsAreVolatile(func) && ConstantOrNullInputsAreNotNull(input, func, analyzer)) {
 			return make_uniq<BoundConstantExpression>(Value::BOOLEAN(value.value()));
 		}
 
@@ -136,13 +156,15 @@ unique_ptr<LogicalOperator> ConstantOrNullSimplification::OptimizeFilter(unique_
 		return op;
 	}
 
-	// Folding constant_or_null into a constant drops the evaluation of the folded-away
-	// inputs, so it is only safe when (1) the plan carries no side effects - a DML
-	// operator can invalidate the table statistics that NotNullExpressionAnalyzer relies
-	// on (e.g. a DML CTE inserts NULLs that the statement's statistics snapshot does not
-	// see), and (2) the filter holds no volatile expressions. The NOT(constant_or_null(...))
-	// shape rewrite above is unaffected by both checks.
-	const bool allow_folding = !plan_has_side_effects && !filter.HasVolatileExpressions();
+	// Folding constant_or_null into a constant drops the evaluation of the folded-away inputs,
+	// so it is only allowed when the plan carries no side effects: a DML operator can invalidate
+	// the table statistics that NotNullExpressionAnalyzer relies on (e.g. a DML CTE inserts
+	// NULLs that the statement's statistics snapshot, taken before execution, does not see).
+	// Volatility is checked per folded input in SimplifyExpression instead of per filter: a
+	// volatile expression elsewhere in the filter subtree (a sibling conjunct, or an operator
+	// below the filter) keeps being evaluated after the fold and must not disable it. The
+	// NOT(constant_or_null(...)) shape rewrite is unaffected by all of this.
+	const bool allow_folding = !plan_has_side_effects;
 
 	NotNullExpressionAnalyzer analyzer(context);
 	vector<unique_ptr<Expression>> remaining_expressions;
